@@ -1,0 +1,68 @@
+services:
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    restart: unless-stopped
+    ulimits:
+      memlock: -1
+    volumes:
+      - dragonfly_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  coordinator:
+    build: .
+    command: python -m workerz.coordinator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "7777:7777"
+    environment:
+      WORKERZ_REDIS_URL: redis://dragonfly:6379
+      WORKERZ_HTTP_PORT: "8000"
+      WORKERZ_TCP_HOST:  "0.0.0.0"
+      WORKERZ_TCP_PORT:  "7777"
+    depends_on:
+      dragonfly:
+        condition: service_healthy
+
+  dashboard:
+    build: .
+    command: python -m workerz.dashboard
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      WORKERZ_REDIS_URL:      redis://dragonfly:6379
+      WORKERZ_DASHBOARD_PORT: "8080"
+    depends_on:
+      dragonfly:
+        condition: service_healthy
+
+  worker-1:
+    build: .
+    command: python -m workerz.worker /app/example_tasks.py
+    restart: on-failure
+    environment:
+      WORKERZ_LABELS:          add,slow,fail
+      WORKERZ_COORDINATOR_HOST: coordinator
+      WORKERZ_COORDINATOR_TCP:  "7777"
+    depends_on:
+      - coordinator
+
+  worker-2:
+    build: .
+    command: python -m workerz.worker /app/example_tasks.py
+    restart: on-failure
+    environment:
+      WORKERZ_LABELS:          add,slow,fail
+      WORKERZ_COORDINATOR_HOST: coordinator
+      WORKERZ_COORDINATOR_TCP:  "7777"
+    depends_on:
+      - coordinator
+
+volumes:
+  dragonfly_data:
