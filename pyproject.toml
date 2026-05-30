@@ -8,6 +8,7 @@ dynamic         = ["version"]
 description     = "Better Workers."
 requires-python = ">=3.11"
 dependencies    = []
+readme = "README.md"
 
 [project.optional-dependencies]
 coordinator = ["starlette>=0.41", "uvicorn>=0.29", "redis>=5.0", "msgspec>=0.18"]
