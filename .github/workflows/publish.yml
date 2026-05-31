@@ -1,8 +1,7 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -13,10 +12,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Set version from commit count
+        run: |
+          COUNT=$(git rev-list --count HEAD)
+          echo "0.0.${COUNT}" > version.txt
+          sed -i "s/__version__ = .*/__version__ = \"0.0.${COUNT}\"/" src/workerz/__init__.py
 
       - name: Build
         run: |
