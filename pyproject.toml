@@ -11,10 +11,10 @@ dependencies    = []
 readme = "README.md"
 
 [project.optional-dependencies]
-coordinator = ["starlette>=0.41", "uvicorn>=0.29", "redis>=5.0", "msgspec>=0.18"]
-dashboard   = ["starlette>=0.41", "uvicorn>=0.29", "redis>=5.0"]
-worker      = ["msgspec>=0.18"]
-sdk         = ["httpx>=0.27"]
+coordinator = ["loguru>=0.7", "python-dotenv>=1.0", "msgspec>=0.18"]
+dashboard   = ["loguru>=0.7", "python-dotenv>=1.0", "starlette>=0.41", "uvicorn>=0.29", "msgspec>=0.18"]
+worker      = ["loguru>=0.7", "python-dotenv>=1.0", "msgspec>=0.18"]
+sdk         = ["loguru>=0.7", "python-dotenv>=1.0", "msgspec>=0.18"]
 full        = ["workerz[coordinator]", "workerz[dashboard]", "workerz[worker]", "workerz[sdk]"]
 
 [tool.setuptools.packages.find]

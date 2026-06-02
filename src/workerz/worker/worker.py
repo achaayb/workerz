@@ -2,44 +2,47 @@ import asyncio
 import importlib.util
 import inspect
 import json
-import os
+import sys
 import uuid
 from pathlib import Path
 
-from workerz.protocol import Cancel, Dispatch, JobStatus, JobUpdate, Ping, Pong, Register, recv_msg, send_msg
+from workerz.logging import setup_logging
+from workerz.protocol import (
+    Cancel, Dispatch, JobStatus, JobUpdate, Ping, Pong, Register,
+    recv_msg, send_msg,
+)
+from workerz.worker.settings import settings
 
-COORDINATOR_HOST = os.environ.get("WORKERZ_COORDINATOR_HOST", "127.0.0.1")
-COORDINATOR_TCP  = int(os.environ.get("WORKERZ_COORDINATOR_TCP", 7777))
-LABELS           = [l.strip() for l in os.environ.get("WORKERZ_LABELS", "").split(",") if l.strip()]
+logger = setup_logging("worker", settings.log_file, settings.log_level)
 
 
 class TaskContext:
-    """Injected as first arg into every task. Collects logs + allows mid-run meta pushes."""
+    def __init__(self, job_id, writer):
+        self.job_id = job_id
+        self.writer = writer
+        self.warnings = []
+        self.infos = []
+        self.debug_lines = []connect
 
-    def __init__(self, job_id: str, writer):
-        self.job_id   = job_id
-        self._writer  = writer
-        self.warnings: list[str] = []
-        self.infos:    list[str] = []
-        self.debug:    list[str] = []
+    def warn(self, message):
+        self.warnings.append(str(message))
+        logger.warning("job {} | {}", self.job_id, message)
 
-    def warn(self, msg: str):
-        self.warnings.append(str(msg))
+    def info(self, message):
+        self.infos.append(str(message))
+        logger.info("job {} | {}", self.job_id, message)
 
-    def info(self, msg: str):
-        self.infos.append(str(msg))
-
-    def debug(self, msg: str):
-        self.debug.append(str(msg))
+    def debug(self, message):
+        self.debug_lines.append(str(message))
+        logger.debug("job {} | {}", self.job_id, message)
 
     async def update(self, **meta):
-        """Push arbitrary meta to coordinator immediately (visible in dashboard)."""
-        await send_msg(self._writer, JobUpdate(job_id=self.job_id, meta=meta))
+        await send_msg(self.writer, JobUpdate(job_id=self.job_id, meta=meta))
 
 
-def load_tasks(filepath: str) -> dict:
-    path   = Path(filepath).resolve()
-    spec   = importlib.util.spec_from_file_location(path.stem, path)
+def load_tasks(filepath):
+    path = Path(filepath).resolve()
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return {
@@ -49,82 +52,116 @@ def load_tasks(filepath: str) -> dict:
     }
 
 
-async def run_task(fn, ctx, args, kwargs):
-    if asyncio.iscoroutinefunction(fn):
-        return await fn(ctx, *args, **kwargs)
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: fn(ctx, *args, **kwargs))
+def run_task(fn, ctx, args, kwargs):
+    return fn(ctx, *args, **kwargs)
 
 
-async def main(filepath: str):
-    if not LABELS:
-        raise RuntimeError("WORKERZ_LABELS is required (comma-separated list)")
+class Worker:
+    def __init__(self, tasks):
+        self.tasks = tasks
+        self.worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+        self.reader = None
+        self.writer = None
+        self.running = {}  # job_id -> asyncio.Task
 
-    tasks     = load_tasks(filepath)
-    worker_id = f"worker-{uuid.uuid4().hex[:8]}"
-    active: dict[str, asyncio.Task] = {}
+    async def connect(self):
+        self.reader, self.writer = await asyncio.open_connection(
+            settings.coordinator_host, settings.coordinator_tcp
+        )
+        await send_msg(self.writer, Register(worker_id=self.worker_id, labels=settings.labels))
+        logger.info("{} registered labels={} tasks={}",
+                    self.worker_id, settings.labels, list(self.tasks))
 
-    print(f"[{worker_id}] labels={LABELS} tasks={list(tasks.keys())}")
-    print(f"[{worker_id}] connecting {COORDINATOR_HOST}:{COORDINATOR_TCP}")
+    async def serve(self):
+        while True:
+            message = await self.next_message()
+            await self.route(message)
 
-    reader, writer = await asyncio.open_connection(COORDINATOR_HOST, COORDINATOR_TCP)
+    async def next_message(self):
+        try:
+            return await recv_msg(self.reader)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            self.shutdown()
 
-    await send_msg(writer, Register(worker_id=worker_id, labels=LABELS))
-    print(f"[{worker_id}] registered")
+    async def route(self, message):
+        match message:
+            case Dispatch():
+                self.running[message.job_id] = asyncio.create_task(self.execute(message))
+            case Cancel():
+                task = self.running.get(message.job_id)
+                if task:
+                    task.cancel()
+            case Ping():
+                await send_msg(self.writer, Pong(worker_id=self.worker_id))
 
-    async def execute(msg: Dispatch):
-        fn  = tasks.get(msg.task)
-        ctx = TaskContext(job_id=msg.job_id, writer=writer)
+    async def execute(self, message):
+        ctx = TaskContext(message.job_id, self.writer)
+        fn = self.tasks.get(message.task)
 
-        if not fn:
-            await send_msg(writer, JobStatus(
-                job_id=msg.job_id, status="error",
-                error=f"unknown task: {msg.task}",
-            ))
+        if fn is None:
+            logger.error("job {} unknown task: {}", message.job_id, message.task)
+            await self.report(ctx, "error", error=f"unknown task: {message.task}")
             return
 
-        await send_msg(writer, JobStatus(job_id=msg.job_id, status="running"))
-        handle = asyncio.create_task(run_task(fn, ctx, msg.args, msg.kwargs))
-        active[msg.job_id] = handle
+        logger.info("job {} running task={}", message.job_id, message.task)
+        await send_msg(self.writer, JobStatus(job_id=message.job_id, status="running"))
 
         try:
-            result = await handle
-            await send_msg(writer, JobStatus(
-                job_id=msg.job_id, status="done",
-                result=json.dumps(result) if result is not None else None,
-                warnings=ctx.warnings, infos=ctx.infos, debug=ctx.debug,
-            ))
-
+            result = await asyncio.to_thread(run_task, fn, ctx, message.args, message.kwargs)
+            logger.info("job {} done", message.job_id)
+            await self.report(ctx, "done", result=result)
         except asyncio.CancelledError:
-            await send_msg(writer, JobStatus(
-                job_id=msg.job_id, status="cancelled",
-                warnings=ctx.warnings, infos=ctx.infos, debug=ctx.debug,
-            ))
-
-        except Exception as e:
-            await send_msg(writer, JobStatus(
-                job_id=msg.job_id, status="error",
-                error=str(e),
-                warnings=ctx.warnings, infos=ctx.infos, debug=ctx.debug,
-            ))
-
+            logger.warning("job {} cancelled", message.job_id)
+            await self.report(ctx, "cancelled")
+        except Exception as error:
+            logger.opt(exception=True).error("job {} raised: {}", message.job_id, error)
+            await self.report(ctx, "error", error=str(error))
         finally:
-            active.pop(msg.job_id, None)
+            self.running.pop(message.job_id, None)
 
-    while True:
-        try:
-            msg = await recv_msg(reader)
-        except (asyncio.IncompleteReadError, ConnectionResetError):
-            print(f"[{worker_id}] coordinator disconnected, reconnecting...")
-            break
+    async def report(self, ctx, status, result=None, error=None):
+        await send_msg(self.writer, JobStatus(
+            job_id=ctx.job_id,
+            status=status,
+            result=json.dumps(result) if result is not None else None,
+            error=error,
+            warnings=ctx.warnings,
+            infos=ctx.infos,
+            debug=ctx.debug_lines,
+        ))
 
-        if isinstance(msg, Dispatch):
-            asyncio.create_task(execute(msg))
-        elif isinstance(msg, Cancel):
-            handle = active.get(msg.job_id)
-            if handle:
-                handle.cancel()
-        elif isinstance(msg, Ping):
-            await send_msg(writer, Pong(worker_id=worker_id))
+    def shutdown(self):
+        # connection lost: the worker is dead, exit so the orchestrator revives it
+        logger.error("{} coordinator connection lost, exiting", self.worker_id)
+        for task in self.running.values():
+            task.cancel()
+        if self.writer:
+            self.writer.close()
+        sys.exit(1)
 
-    writer.close()
+
+async def main(filepath):
+    worker = Worker(load_tasks(filepath))
+    await worker.connect()
+    await worker.serve()
+
+def run():
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m workerz.worker")
+    parser.add_argument("file", help="path to tasks .py file")
+    args = parser.parse_args()
+
+    if not settings.labels:
+        logger.error("WORKERZ_LABELS is required (comma-separated list)")
+        sys.exit(1)
+
+    try:
+        asyncio.run(main(args.file))
+    except KeyboardInterrupt:
+        logger.info("worker stopped")
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("worker crashed")
+        raise

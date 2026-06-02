@@ -1,7 +1,32 @@
+import asyncio
 import time
-import httpx
+import uuid
+
+from workerz.protocol import (
+    CancelJob, GetJob, Reply, SubmitJob, recv_msg, send_msg,
+)
 from workerz.task import task  # re-exported for convenience
 from workerz.exceptions import JobNotFound, WorkerError, NoWorkerAvailable
+
+
+async def _request(host: str, port: int, msg) -> Reply:
+    reader, writer = await asyncio.open_connection(host, port)
+    try:
+        await send_msg(writer, msg)
+        reply = await recv_msg(reader)
+        if not isinstance(reply, Reply):
+            raise WorkerError(f"unexpected reply: {type(reply).__name__}")
+        return reply
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 class Job:
@@ -63,31 +88,54 @@ class Job:
 
 
 class Client:
-    def __init__(self, base_url: str = "http://127.0.0.1:8000"):
-        self.base = base_url.rstrip("/")
+    def __init__(self, host: str = None, port: int = None):
+        from workerz.logging import setup_logging
+        from workerz.sdk.settings import settings
+        self.host = host or settings.coordinator_host
+        self.port = int(port or settings.coordinator_tcp)
+        self._log = setup_logging("sdk", settings.log_file, settings.log_level)
+
+    async def _submit_async(self, task: str, args, kwargs, labels) -> str:
+        reply = await _request(self.host, self.port, SubmitJob(
+            rid=uuid.uuid4().hex, task=task,
+            args=args or [], kwargs=kwargs or {}, labels=labels or [],
+        ))
+        if not reply.ok:
+            if reply.err == "no_worker":
+                self._log.warning("submit rejected: no worker for labels {}", labels)
+                raise NoWorkerAvailable(f"no worker available for labels {labels}")
+            self._log.error("submit failed: {}", reply.err)
+            raise WorkerError(reply.err or "submit failed")
+        self._log.info("submitted task={} job={}", task, reply.data["job_id"])
+        return reply.data["job_id"]
+
+    async def _get_async(self, job_id: str) -> dict:
+        reply = await _request(self.host, self.port, GetJob(rid=uuid.uuid4().hex, job_id=job_id))
+        if not reply.ok:
+            if reply.err == "not_found":
+                raise JobNotFound(job_id)
+            raise WorkerError(reply.err or "get failed")
+        return reply.data
+
+    async def _cancel_async(self, job_id: str) -> dict:
+        reply = await _request(self.host, self.port, CancelJob(rid=uuid.uuid4().hex, job_id=job_id))
+        if not reply.ok:
+            if reply.err == "not_found":
+                raise JobNotFound(job_id)
+            raise WorkerError(reply.err or "cancel failed")
+        self._log.info("cancelled job {}", job_id)
+        return reply.data
 
     def _get_job_raw(self, job_id: str) -> dict:
-        resp = httpx.get(f"{self.base}/job/{job_id}")
-        if resp.status_code == 404:
-            raise JobNotFound(job_id)
-        resp.raise_for_status()
-        return resp.json()
+        return _run(self._get_async(job_id))
 
-    def run(self, task: str, args: list = None, kwargs: dict = None, labels: list[str] = None) -> Job:
-        resp = httpx.post(f"{self.base}/job", json={
-            "task": task, "args": args or [], "kwargs": kwargs or {}, "labels": labels or [],
-        })
-        if resp.status_code == 409:
-            raise NoWorkerAvailable(resp.json().get("detail", "no worker available"))
-        resp.raise_for_status()
-        return Job(self._get_job_raw(resp.json()["job_id"]), self)
+    def run(self, task: str, args: list = None, kwargs: dict = None,
+            labels: list[str] = None) -> Job:
+        job_id = _run(self._submit_async(task, args, kwargs, labels))
+        return Job(self._get_job_raw(job_id), self)
 
     def job(self, job_id: str) -> Job:
         return Job(self._get_job_raw(job_id), self)
 
     def cancel(self, job_id: str) -> dict:
-        resp = httpx.delete(f"{self.base}/job/{job_id}")
-        if resp.status_code == 404:
-            raise JobNotFound(job_id)
-        resp.raise_for_status()
-        return resp.json()
+        return _run(self._cancel_async(job_id))

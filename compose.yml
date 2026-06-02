@@ -1,50 +1,54 @@
-# Build the wheel once (the image), run every component from it.
-# Edit source -> rebuild:  docker compose up --build
-
 x-app: &app
   build: .
   restart: on-failure
-  environment:
-    WORKERZ_REDIS_URL: redis://dragonfly:6379
+  env_file:
+    - path: .env
+      required: false
 
 services:
-  dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
-    ulimits: { memlock: -1 }
-
   coordinator:
     <<: *app
     command: python -m workerz.coordinator
-    ports: ["8000:8000", "7777:7777"]
+    ports: ["7777:7777"]
     environment:
-      WORKERZ_REDIS_URL: redis://dragonfly:6379
-      WORKERZ_HTTP_PORT: "8000"
       WORKERZ_TCP_HOST: "0.0.0.0"
       WORKERZ_TCP_PORT: "7777"
-    depends_on: [dragonfly]
+      WORKERZ_COORDINATOR_LOG: /app/logs/coordinator.log
+    volumes:
+      - ./logs:/app/logs
 
   dashboard:
     <<: *app
     command: python -m workerz.dashboard
     ports: ["8080:8080"]
     environment:
-      WORKERZ_REDIS_URL: redis://dragonfly:6379
       WORKERZ_DASHBOARD_PORT: "8080"
-    depends_on: [dragonfly]
+      WORKERZ_COORDINATOR_HOST: coordinator
+      WORKERZ_COORDINATOR_TCP: "7777"
+      WORKERZ_DASHBOARD_LOG: /app/logs/dashboard.log
+    volumes:
+      - ./logs:/app/logs
+    depends_on: [coordinator]
 
   worker:
     <<: *app
     command: python -m workerz.worker /app/example_tasks.py
     environment:
-      WORKERZ_REDIS_URL: redis://dragonfly:6379
       WORKERZ_LABELS: add,slow,fail,buggy
       WORKERZ_COORDINATOR_HOST: coordinator
       WORKERZ_COORDINATOR_TCP: "7777"
+      WORKERZ_WORKER_LOG: /app/logs/worker.log
+    volumes:
+      - ./logs:/app/logs
     depends_on: [coordinator]
 
   submitter:
     <<: *app
     command: python /app/submitter.py
     environment:
-      WORKERZ_COORDINATOR_URL: http://coordinator:8000
+      WORKERZ_COORDINATOR_HOST: coordinator
+      WORKERZ_COORDINATOR_TCP: "7777"
+      WORKERZ_SDK_LOG: /app/logs/sdk.log
+    volumes:
+      - ./logs:/app/logs
     depends_on: [coordinator]

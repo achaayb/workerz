@@ -31,7 +31,6 @@
             </div>
         </div>
 
-        <!-- Stats -->
         <div class="row u-no-margin--bottom" style="margin-bottom:0.8rem;">
             <div class="col-2"><div class="p-card u-no-margin u-align--center" style="padding:0.4rem 0.2rem;">
                 <div class="p-heading--4 u-no-margin" id="stat-total">0</div>
@@ -59,27 +58,22 @@
             </div></div>
         </div>
 
-        <!-- Workers -->
-        <div class="row" style="margin-bottom:0.8rem;">
-            <div class="col-12">
+        <div class="row">
+            <div class="col-6">
                 <p class="p-muted-heading">Workers</p>
                 <table class="p-table" style="width:100%">
-                    <thead><tr><th>ID</th><th>Labels</th><th>Status</th><th>Current Job</th><th>Last Seen</th></tr></thead>
+                    <thead><tr><th>ID</th><th>Labels</th><th>Status</th><th>Job</th></tr></thead>
                     <tbody id="workers-body">
-                        <tr><td colspan="5" class="u-align--center u-text--muted"><em>no workers</em></td></tr>
+                        <tr><td colspan="4" class="u-align--center u-text--muted"><em>no workers</em></td></tr>
                     </tbody>
                 </table>
             </div>
-        </div>
-
-        <!-- Jobs -->
-        <div class="row">
-            <div class="col-12">
+            <div class="col-6">
                 <p class="p-muted-heading">Jobs</p>
                 <table class="p-table" style="width:100%">
-                    <thead><tr><th>Job ID</th><th>Task</th><th>Labels</th><th>Status</th><th>Worker</th><th>Created</th><th>Finished</th></tr></thead>
+                    <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Worker</th></tr></thead>
                     <tbody id="jobs-body">
-                        <tr><td colspan="7" class="u-align--center u-text--muted"><em>no jobs</em></td></tr>
+                        <tr><td colspan="4" class="u-align--center u-text--muted"><em>no jobs</em></td></tr>
                     </tbody>
                 </table>
             </div>
@@ -96,21 +90,18 @@
                 dispatched:"", running:"caution", done:"positive", error:"negative", cancelled:""
             };
             const shortId = id => id ? id.slice(0,8) : "—";
-            const fmtTime = iso => iso ? new Date(iso).toLocaleTimeString("en-GB",{hour12:false}) : "—";
             const badge   = s => { const t=BADGE[s]??""; return t ? `<span class="p-status-label--${t}">${s}</span>` : `<span class="p-status-label">${s}</span>`; };
-            const dot     = s => { const c={idle:"#0e8420",busy:"#f99b11",offline:"#aaa"}[s]??"#aaa"; return `<span style="color:${c};margin-right:4px;">&#x25cf;</span>`; };
             const mono    = t => `<span style="font-family:monospace;color:#999;">${t}</span>`;
             const chips   = arr => (arr||[]).map(l=>`<span style="background:#e5e5e5;border-radius:3px;padding:1px 5px;font-size:0.6rem;margin-right:2px;">${l}</span>`).join("");
 
             function renderWorkers(workers) {
                 const $b = $("#workers-body").empty();
-                if (!workers.length) { $b.html('<tr><td colspan="5" class="u-align--center u-text--muted"><em>no workers</em></td></tr>'); return; }
+                if (!workers.length) { $b.html('<tr><td colspan="4" class="u-align--center u-text--muted"><em>no workers</em></td></tr>'); return; }
                 workers.forEach(w => $b.append(`<tr>
                     <td>${mono(shortId(w.id))}</td>
                     <td>${chips(w.labels)}</td>
-                    <td>${dot(w.status)}${badge(w.status)}</td>
-                    <td>${w.current_job ? mono(shortId(w.current_job)) : "—"}</td>
-                    <td class="u-text--muted">${fmtTime(w.last_seen)}</td></tr>`));
+                    <td>${badge(w.status)}</td>
+                    <td>${w.current_job ? mono(shortId(w.current_job)) : "—"}</td></tr>`));
                 $("#hdr-worker-count").text(workers.filter(w=>w.status!=="offline").length);
                 $("#stat-idle").text(workers.filter(w=>w.status==="idle").length);
             }
@@ -121,15 +112,12 @@
                 });
                 $("#hdr-queued").text(jobs.filter(j=>j.status==="queued").length);
                 const $b = $("#jobs-body").empty();
-                if (!jobs.length) { $b.html('<tr><td colspan="7" class="u-align--center u-text--muted"><em>no jobs</em></td></tr>'); return; }
+                if (!jobs.length) { $b.html('<tr><td colspan="4" class="u-align--center u-text--muted"><em>no jobs</em></td></tr>'); return; }
                 jobs.forEach(j => $b.append(`<tr>
                     <td>${mono(shortId(j.id))}</td>
                     <td><strong>${j.task}</strong></td>
-                    <td>${chips(j.labels)}</td>
                     <td>${badge(j.status)}</td>
-                    <td>${j.worker_id ? mono(shortId(j.worker_id)) : "—"}</td>
-                    <td>${fmtTime(j.created_at)}</td>
-                    <td>${fmtTime(j.finished_at)}</td></tr>`));
+                    <td>${j.worker_id ? mono(shortId(j.worker_id)) : "—"}</td></tr>`));
             }
 
             function poll() {

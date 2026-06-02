@@ -1,13 +1,12 @@
-"""Long-running SDK consumer. Submits one of each task type per lap and
-reports the previous lap's outcomes (so it never blocks on the slow task)."""
+"""Long-running SDK consumer. Submits one task at a time, waits for it,
+reports the outcome, then moves to the next."""
 import itertools
-import os
 import time
 
 from workerz.sdk.client import Client
 from workerz.exceptions import NoWorkerAvailable
 
-c = Client(os.environ.get("WORKERZ_COORDINATOR_URL", "http://127.0.0.1:8000"))
+c = Client()  # host/port from settings / .env
 
 SPECS = [
     ("add",   [2, 3], {}),
@@ -33,23 +32,15 @@ def report(job):
     print(line, flush=True)
 
 
-pending = []
 for _ in itertools.count():
-    for j in pending:
-        try:
-            report(j)
-        except Exception as e:
-            print(f"[report-err] {j.id[:8]}: {e!r}", flush=True)
-    pending = []
-
     for name, args, kwargs in SPECS:
         try:
             job = c.run(name, args=args, kwargs=kwargs)
             print(f"[submit   ] {name} -> {job.id[:8]}", flush=True)
-            pending.append(job)
+            report(job)
         except NoWorkerAvailable as e:
             print(f"[no-worker] {name}: {e}", flush=True)
         except Exception as e:
             print(f"[submit-err] {name}: {e!r}", flush=True)
-
-    time.sleep(2)
+        finally:
+            time.sleep(2)

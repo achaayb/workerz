@@ -2,6 +2,8 @@ import struct
 import msgspec
 
 
+# ── worker <-> coordinator ────────────────────────────────────────────────────
+
 class Register(msgspec.Struct, tag=True):
     worker_id: str
     labels:    list[str]
@@ -42,7 +44,47 @@ class Pong(msgspec.Struct, tag=True):
     worker_id: str
 
 
-Message = Register | Dispatch | Cancel | JobStatus | JobUpdate | Ping | Pong
+# ── client (SDK) <-> coordinator ──────────────────────────────────────────────
+# Request/reply over a short-lived connection. rid correlates reply to request.
+
+class SubmitJob(msgspec.Struct, tag=True):
+    rid:    str
+    task:   str
+    args:   list
+    kwargs: dict
+    labels: list[str]
+
+
+class GetJob(msgspec.Struct, tag=True):
+    rid:    str
+    job_id: str
+
+
+class CancelJob(msgspec.Struct, tag=True):
+    rid:    str
+    job_id: str
+
+
+class ListJobs(msgspec.Struct, tag=True):
+    rid: str
+
+
+class ListWorkers(msgspec.Struct, tag=True):
+    rid: str
+
+
+class Reply(msgspec.Struct, tag=True):
+    """Generic reply. ok=False -> err carries an error code (str)."""
+    rid:  str
+    ok:   bool
+    data: dict | list | None = None
+    err:  str | None = None
+
+
+Message = (
+    Register | Dispatch | Cancel | JobStatus | JobUpdate | Ping | Pong
+    | SubmitJob | GetJob | CancelJob | ListJobs | ListWorkers | Reply
+)
 
 _encoder = msgspec.json.Encoder()
 _decoder = msgspec.json.Decoder(Message)

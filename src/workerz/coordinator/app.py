@@ -1,376 +1,304 @@
-"""
-Coordinator — stateless re: jobs (all job state lives in Redis).
-In-memory: only TCP writer handles.
-
-HTTP routes:
-  POST   /job          submit job
-  GET    /job/{id}     get job (status + result envelope)
-  DELETE /job/{id}     cancel job
-
-TCP: workers connect, coordinator pushes Dispatch messages.
-"""
-
 import asyncio
 import json
-import os
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-import redis.asyncio as aioredis
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
+from workerz.logging import setup_logging
 from workerz.protocol import (
-    Cancel, Dispatch, JobStatus, JobUpdate, Ping, Pong, Register,
-    recv_msg, send_msg,
+    Cancel, CancelJob, Dispatch, GetJob, JobStatus, JobUpdate, ListJobs,
+    ListWorkers, Ping, Pong, Register, Reply, SubmitJob, recv_msg, send_msg,
 )
+from workerz.coordinator.settings import settings
+from workerz.coordinator.state import State
 
-TCP_HOST  = os.environ.get("WORKERZ_TCP_HOST", "0.0.0.0")
-TCP_PORT  = int(os.environ.get("WORKERZ_TCP_PORT", 7777))
-HTTP_PORT = int(os.environ.get("WORKERZ_HTTP_PORT", 8000))
-REDIS_URL = os.environ.get("WORKERZ_REDIS_URL", "redis://localhost:6379")
-
-PING_INTERVAL = 10
-PONG_TIMEOUT  = 15
-
-# Only thing kept in memory: writer handles keyed by worker_id
-_writers: dict[str, asyncio.StreamWriter] = {}
-
-rdb: aioredis.Redis  = None
-queue: asyncio.Queue = None
+logger = setup_logging("coordinator", settings.log_file, settings.log_level)
 
 
-def _now() -> str:
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Redis helpers ─────────────────────────────────────────────────────────────
-
-async def _save_worker(worker_id: str, labels: list[str], status: str, current_job: str = ""):
-    await rdb.sadd("workerz:workers", worker_id)
-    await rdb.hset(f"workerz:worker:{worker_id}", mapping={
-        "id":          worker_id,
-        "labels":      json.dumps(labels),
-        "status":      status,
-        "current_job": current_job,
-        "last_seen":   _now(),
-    })
+class WorkerConn:
+    def __init__(self, worker_id, labels, writer):
+        self.worker_id = worker_id
+        self.labels = set(labels)
+        self.writer = writer
+        self.status = "idle"  # idle | busy
+        self.current_job = None
+        self.last_pong = asyncio.get_event_loop().time()
 
 
-async def _delete_worker(worker_id: str):
-    await rdb.srem("workerz:workers", worker_id)
-    await rdb.delete(f"workerz:worker:{worker_id}")
+class Coordinator:
+    def __init__(self):
+        self.state = State()
+        self.queue = asyncio.Queue()
+        self.workers = {}  # worker_id -> WorkerConn
+        self.lock = asyncio.Lock()
 
+    # ── connections ───────────────────────────────────────────────────────────
 
-async def _save_job(job: dict):
-    await rdb.sadd("workerz:jobs", job["id"])
-    await rdb.hset(f"workerz:job:{job['id']}", mapping={
-        "id":          job["id"],
-        "task":        job["task"],
-        "args":        json.dumps(job["args"]),
-        "kwargs":      json.dumps(job["kwargs"]),
-        "labels":      json.dumps(job.get("labels") or []),
-        "status":      job["status"],
-        "worker_id":   job.get("worker_id") or "",
-        "result":      job.get("result") or "",
-        "error":       job.get("error") or "",
-        "warnings":    json.dumps(job.get("warnings") or []),
-        "infos":       json.dumps(job.get("infos") or []),
-        "debug":       json.dumps(job.get("debug") or []),
-        "meta":        json.dumps(job.get("meta") or {}),
-        "created_at":  job["created_at"],
-        "finished_at": job.get("finished_at") or "",
-    })
-
-
-async def _load_job(job_id: str) -> dict | None:
-    raw = await rdb.hgetall(f"workerz:job:{job_id}")
-    if not raw:
-        return None
-    return {
-        "id":          raw["id"],
-        "task":        raw["task"],
-        "args":        json.loads(raw["args"]),
-        "kwargs":      json.loads(raw["kwargs"]),
-        "labels":      json.loads(raw.get("labels", "[]")),
-        "status":      raw["status"],
-        "worker_id":   raw.get("worker_id") or None,
-        "result":      json.loads(raw["result"]) if raw.get("result") else None,
-        "error":       raw.get("error") or None,
-        "warnings":    json.loads(raw.get("warnings", "[]")),
-        "infos":       json.loads(raw.get("infos", "[]")),
-        "debug":       json.loads(raw.get("debug", "[]")),
-        "meta":        json.loads(raw.get("meta", "{}")),
-        "created_at":  raw["created_at"],
-        "finished_at": raw.get("finished_at") or None,
-    }
-
-
-async def _load_all_workers() -> list[dict]:
-    ids  = await rdb.smembers("workerz:workers")
-    out  = []
-    for wid in ids:
-        raw = await rdb.hgetall(f"workerz:worker:{wid}")
-        if raw:
-            out.append({
-                "id":          raw["id"],
-                "labels":      json.loads(raw.get("labels", "[]")),
-                "status":      raw.get("status", "offline"),
-                "current_job": raw.get("current_job") or None,
-                "last_seen":   raw.get("last_seen"),
-            })
-    return out
-
-
-# ── Dispatch ──────────────────────────────────────────────────────────────────
-
-async def _find_idle_worker(labels: list[str]) -> tuple[str, list[str]] | None:
-    """Return (worker_id, worker_labels) of an idle worker matching all requested labels, or None."""
-    for wid, writer in _writers.items():
-        raw = await rdb.hgetall(f"workerz:worker:{wid}")
-        if not raw or raw.get("status") != "idle":
-            continue
-        worker_labels = set(json.loads(raw.get("labels", "[]")))
-        if not labels or set(labels).issubset(worker_labels):
-            return wid, list(worker_labels)
-    return None
-
-
-async def _dispatch_next():
-    """Try to assign queued jobs to idle workers."""
-    pending = []
-    while not queue.empty():
-        job = await queue.get()
-        match = await _find_idle_worker(job.get("labels") or [])
-        if match:
-            wid, _ = match
-            await _assign(wid, job)
-        else:
-            pending.append(job)
-    for job in pending:
-        await queue.put(job)
-
-
-async def _assign(worker_id: str, job: dict):
-    writer = _writers.get(worker_id)
-    if not writer:
-        await queue.put(job)
-        return
-
-    raw = await rdb.hgetall(f"workerz:worker:{worker_id}")
-    labels = json.loads(raw.get("labels", "[]")) if raw else []
-
-    job["status"]    = "dispatched"
-    job["worker_id"] = worker_id
-    await _save_job(job)
-    await _save_worker(worker_id, labels, "busy", job["id"])
-    await send_msg(writer, Dispatch(
-        job_id=job["id"], task=job["task"],
-        args=job["args"], kwargs=job["kwargs"],
-    ))
-
-
-# ── TCP ───────────────────────────────────────────────────────────────────────
-
-async def handle_worker(reader, writer):
-    worker_id = None
-    labels    = []
-    try:
-        msg = await recv_msg(reader)
-        if not isinstance(msg, Register):
+    async def handle_conn(self, reader, writer):
+        try:
+            first = await recv_msg(reader)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
             writer.close()
             return
 
-        worker_id = msg.worker_id
-        labels    = msg.labels
-        _writers[worker_id] = writer
+        match first:
+            case Register():
+                await self.handle_worker(first, reader, writer)
+            case SubmitJob() | GetJob() | CancelJob() | ListJobs() | ListWorkers():
+                await self.handle_client(first, writer)
+            case _:
+                logger.warning("bad first frame: {}", type(first).__name__)
+                writer.close()
 
-        await _save_worker(worker_id, labels, "idle")
-        print(f"[coordinator] worker {worker_id} connected labels={labels}")
+    # ── worker channel ──────────────────────────────────────────────────────
 
-        await _dispatch_next()
-        asyncio.create_task(_ping_loop(worker_id, writer))
+    async def handle_worker(self, register, reader, writer):
+        worker = WorkerConn(register.worker_id, register.labels, writer)
+        self.workers[worker.worker_id] = worker
+        self.mirror(worker)
+        logger.info("worker {} connected labels={}", worker.worker_id, sorted(worker.labels))
 
-        while True:
-            msg = await recv_msg(reader)
+        await self.dispatch_queued()
+        heartbeat = asyncio.create_task(self.heartbeat(worker))
 
-            if isinstance(msg, Pong):
-                pass  # heartbeat ack, nothing to do
+        try:
+            while True:
+                message = await recv_msg(reader)
+                await self.route_worker_message(worker, message)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        except Exception:
+            logger.exception("error on worker {} connection", worker.worker_id)
+        finally:
+            heartbeat.cancel()
+            self.drop_worker(worker)
+            writer.close()
 
-            elif isinstance(msg, JobStatus):
-                job = await _load_job(msg.job_id)
-                if not job:
-                    continue
-
-                if msg.status == "running":
-                    job["status"] = "running"
-                    await _save_job(job)
-                    await _save_worker(worker_id, labels, "busy", msg.job_id)
-
-                elif msg.status in ("done", "error", "cancelled"):
-                    job.update({
-                        "status":      msg.status,
-                        "result":      json.loads(msg.result) if msg.result else None,
-                        "error":       msg.error,
-                        "warnings":    msg.warnings,
-                        "infos":       msg.infos,
-                        "debug":       msg.debug,
-                        "finished_at": _now(),
-                    })
-                    await _save_job(job)
-                    await _save_worker(worker_id, labels, "idle")
-                    await _dispatch_next()
-
-            elif isinstance(msg, JobUpdate):
-                # Merge meta into job
-                job = await _load_job(msg.job_id)
+    async def route_worker_message(self, worker, message):
+        match message:
+            case Pong():
+                worker.last_pong = asyncio.get_event_loop().time()
+            case JobStatus():
+                await self.apply_job_status(worker, message)
+            case JobUpdate():
+                job = self.state.get_job(message.job_id)
                 if job:
-                    job["meta"].update(msg.meta)
-                    await _save_job(job)
+                    job["meta"].update(message.meta)
+                    self.state.set_job(job)
 
-    except (asyncio.IncompleteReadError, ConnectionResetError):
-        pass
-    finally:
-        if worker_id:
-            _writers.pop(worker_id, None)
-            await _save_worker(worker_id, labels, "offline")
-            print(f"[coordinator] worker {worker_id} disconnected")
+    async def apply_job_status(self, worker, message):
+        job = self.state.get_job(message.job_id)
+        if not job:
+            return
 
+        if message.status == "running":
+            job["status"] = "running"
+            self.state.set_job(job)
+            return
 
-async def _ping_loop(worker_id: str, writer):
-    loop = asyncio.get_event_loop()
-    last_pong = loop.time()
-    try:
-        while _writers.get(worker_id) is writer:
-            await asyncio.sleep(PING_INTERVAL)
-            if _writers.get(worker_id) is not writer:
-                break
-            await send_msg(writer, Ping())
-            await asyncio.sleep(PONG_TIMEOUT)
-            # If no pong within window, drop connection
-            raw = await rdb.hgetall(f"workerz:worker:{worker_id}")
-            if raw.get("status") == "offline":
-                break
-    except Exception:
-        pass
+        job.update({
+            "status": message.status,
+            "result": json.loads(message.result) if message.result else None,
+            "error": message.error,
+            "warnings": message.warnings,
+            "infos": message.infos,
+            "debug": message.debug,
+            "finished_at": now(),
+        })
+        self.state.set_job(job)
+        worker.status = "idle"
+        worker.current_job = None
+        self.mirror(worker)
 
+        if message.status == "error":
+            logger.error("job {} failed on worker {}: {}", message.job_id, worker.worker_id, message.error)
+        else:
+            logger.info("job {} {} on worker {}", message.job_id, message.status, worker.worker_id)
+        await self.dispatch_queued()
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+    def drop_worker(self, worker):
+        self.workers.pop(worker.worker_id, None)
+        stored = self.state.get_worker(worker.worker_id)
+        if stored:
+            stored["status"] = "offline"
+            stored["current_job"] = None
+            self.state.set_worker(stored)
 
-async def route_post_job(request: Request):
-    body = await request.json()
-    labels = body.get("labels") or []
-
-    # Fail fast if no worker with these labels is registered at all
-    if labels:
-        all_workers = await _load_all_workers()
-        label_set   = set(labels)
-        if not any(label_set.issubset(set(w["labels"])) for w in all_workers):
-            return JSONResponse(
-                {"error": "no_worker", "detail": f"no worker registered with labels {labels}"},
-                status_code=409,
-            )
-
-    job_id = str(uuid.uuid4())
-    job = {
-        "id":          job_id,
-        "task":        body["task"],
-        "args":        body.get("args", []),
-        "kwargs":      body.get("kwargs", {}),
-        "labels":      labels,
-        "status":      "queued",
-        "worker_id":   None,
-        "result":      None,
-        "error":       None,
-        "warnings":    [],
-        "infos":       [],
-        "debug":       [],
-        "meta":        {},
-        "created_at":  _now(),
-        "finished_at": None,
-    }
-    await _save_job(job)
-
-    match = await _find_idle_worker(labels)
-    if match:
-        wid, _ = match
-        await _assign(wid, job)
-    else:
-        await queue.put(job)
-
-    return JSONResponse({"job_id": job_id})
-
-
-async def route_get_job(request: Request):
-    job = await _load_job(request.path_params["job_id"])
-    if not job:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse(job)
-
-
-async def route_cancel_job(request: Request):
-    job_id = request.path_params["job_id"]
-    job    = await _load_job(job_id)
-    if not job:
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    if job["status"] == "queued":
-        job.update({"status": "cancelled", "finished_at": _now()})
-        await _save_job(job)
-        return JSONResponse({"cancelled": True})
-
-    if job["status"] in ("dispatched", "running"):
-        wid = job.get("worker_id")
-        if wid and _writers.get(wid):
-            await send_msg(_writers[wid], Cancel(job_id=job_id))
-        job.update({"status": "cancelled", "finished_at": _now()})
-        await _save_job(job)
-        return JSONResponse({"cancelling": True})
-
-    return JSONResponse({"error": "not cancellable", "status": job["status"]})
-
-
-# ── Lifespan ──────────────────────────────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app):
-    global rdb, queue
-    queue = asyncio.Queue()
-    rdb   = aioredis.from_url(REDIS_URL, decode_responses=True)
-
-    # Re-queue jobs that were in-flight when coordinator last died
-    for jid in await rdb.smembers("workerz:jobs"):
-        raw = await rdb.hgetall(f"workerz:job:{jid}")
-        if raw and raw.get("status") in ("queued", "dispatched"):
-            job = await _load_job(jid)
-            if job:
-                job["status"]    = "queued"
+        # the dead worker will never report on its job, so requeue it
+        if worker.current_job:
+            job = self.state.get_job(worker.current_job)
+            if job and job["status"] in ("dispatched", "running"):
+                job["status"] = "queued"
                 job["worker_id"] = None
-                await _save_job(job)
-                await queue.put(job)
+                self.state.set_job(job)
+                self.queue.put_nowait(job)
+                logger.warning("requeued job {} after worker {} died", job["id"], worker.worker_id)
+        logger.info("worker {} disconnected", worker.worker_id)
 
-    # Mark all workers offline (they'll re-register via TCP)
-    for wid in await rdb.smembers("workerz:workers"):
-        raw = await rdb.hgetall(f"workerz:worker:{wid}")
-        if raw:
-            await rdb.hset(f"workerz:worker:{wid}", mapping={"status": "offline", "current_job": ""})
+    async def heartbeat(self, worker):
+        loop = asyncio.get_event_loop()
+        try:
+            while self.workers.get(worker.worker_id) is worker:
+                await asyncio.sleep(settings.ping_interval)
+                try:
+                    await send_msg(worker.writer, Ping())
+                except Exception:
+                    return
+                await asyncio.sleep(settings.pong_timeout)
+                if loop.time() - worker.last_pong > settings.ping_interval + settings.pong_timeout:
+                    logger.warning("worker {} missed heartbeat, dropping", worker.worker_id)
+                    worker.writer.close()
+                    return
+        except asyncio.CancelledError:
+            pass
 
-    tcp = await asyncio.start_server(handle_worker, TCP_HOST, TCP_PORT)
-    asyncio.get_event_loop().create_task(tcp.serve_forever())
-    print(f"coordinator  http://0.0.0.0:{HTTP_PORT}  tcp://0.0.0.0:{TCP_PORT}  redis={REDIS_URL}")
-    yield
-    tcp.close()
-    await rdb.aclose()
+    # ── dispatch ──────────────────────────────────────────────────────────────
+
+    def find_idle_worker(self, labels):
+        needed = set(labels)
+        for worker in self.workers.values():
+            if worker.status == "idle" and (not needed or needed.issubset(worker.labels)):
+                return worker
+        return None
+
+    def has_capable_worker(self, labels):
+        needed = set(labels)
+        return any(not needed or needed.issubset(w.labels) for w in self.workers.values())
+
+    async def assign(self, worker, job):
+        worker.status = "busy"
+        worker.current_job = job["id"]
+        job["status"] = "dispatched"
+        job["worker_id"] = worker.worker_id
+        self.state.set_job(job)
+        self.mirror(worker)
+        await send_msg(worker.writer, Dispatch(
+            job_id=job["id"], task=job["task"], args=job["args"], kwargs=job["kwargs"],
+        ))
+        logger.info("dispatched job {} task={} -> worker {}", job["id"], job["task"], worker.worker_id)
+
+    async def enqueue(self, job):
+        async with self.lock:
+            worker = self.find_idle_worker(job["labels"])
+            if worker:
+                await self.assign(worker, job)
+            else:
+                self.queue.put_nowait(job)
+
+    async def dispatch_queued(self):
+        async with self.lock:
+            deferred = []
+            while not self.queue.empty():
+                job = self.queue.get_nowait()
+                worker = self.find_idle_worker(job["labels"])
+                if worker:
+                    await self.assign(worker, job)
+                else:
+                    deferred.append(job)
+            for job in deferred:
+                self.queue.put_nowait(job)
+
+    def mirror(self, worker):
+        self.state.set_worker({
+            "id": worker.worker_id,
+            "labels": sorted(worker.labels),
+            "status": worker.status,
+            "current_job": worker.current_job,
+            "last_seen": now(),
+        })
+
+    # ── client requests ────────────────────────────────────────────────────────
+
+    async def handle_client(self, request, writer):
+        try:
+            reply = await self.answer(request)
+            await send_msg(writer, reply)
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        except Exception:
+            logger.exception("error handling {}", type(request).__name__)
+            await send_msg(writer, Reply(rid=request.rid, ok=False, err="internal_error"))
+        finally:
+            await writer.drain()
+            writer.close()
+
+    async def answer(self, request):
+        match request:
+            case SubmitJob():
+                return await self.submit(request)
+            case GetJob():
+                return self.get(request)
+            case CancelJob():
+                return await self.cancel(request)
+            case ListJobs():
+                jobs = sorted(self.state.list_jobs(), key=lambda j: j["created_at"], reverse=True)
+                return Reply(rid=request.rid, ok=True, data=jobs)
+            case ListWorkers():
+                return Reply(rid=request.rid, ok=True, data=self.state.list_workers())
+
+    async def submit(self, request):
+        labels = request.labels or []
+        if labels and not self.has_capable_worker(labels):
+            return Reply(rid=request.rid, ok=False, err="no_worker")
+
+        job = {
+            "id": str(uuid.uuid4()),
+            "task": request.task, "args": request.args, "kwargs": request.kwargs,
+            "labels": labels, "status": "queued", "worker_id": None,
+            "result": None, "error": None, "warnings": [], "infos": [], "debug": [],
+            "meta": {}, "created_at": now(), "finished_at": None,
+        }
+        self.state.set_job(job)
+        await self.enqueue(job)
+        logger.info("submit task={} labels={} -> {}", request.task, labels, job["id"])
+        return Reply(rid=request.rid, ok=True, data={"job_id": job["id"]})
+
+    def get(self, request):
+        job = self.state.get_job(request.job_id)
+        if not job:
+            return Reply(rid=request.rid, ok=False, err="not_found")
+        return Reply(rid=request.rid, ok=True, data=job)
+
+    async def cancel(self, request):
+        job = self.state.get_job(request.job_id)
+        if not job:
+            return Reply(rid=request.rid, ok=False, err="not_found")
+
+        if job["status"] == "queued":
+            job.update({"status": "cancelled", "finished_at": now()})
+            self.state.set_job(job)
+            logger.info("cancelled queued job {}", job["id"])
+            return Reply(rid=request.rid, ok=True, data={"cancelled": True})
+
+        if job["status"] in ("dispatched", "running"):
+            worker = self.workers.get(job["worker_id"])
+            if worker:
+                await send_msg(worker.writer, Cancel(job_id=job["id"]))
+            job.update({"status": "cancelled", "finished_at": now()})
+            self.state.set_job(job)
+            logger.info("cancelling running job {}", job["id"])
+            return Reply(rid=request.rid, ok=True, data={"cancelling": True})
+
+        return Reply(rid=request.rid, ok=False, err="not_cancellable")
 
 
-app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Route("/job",          route_post_job,    methods=["POST"]),
-        Route("/job/{job_id}", route_get_job,     methods=["GET"]),
-        Route("/job/{job_id}", route_cancel_job,  methods=["DELETE"]),
-    ],
-)
+async def main():
+    coordinator = Coordinator()
+    server = await asyncio.start_server(coordinator.handle_conn, settings.tcp_host, settings.tcp_port)
+    logger.info("coordinator listening tcp://{}:{}  build={}  env={}",
+                settings.tcp_host, settings.tcp_port, settings.build_version, settings.env)
+    async with server:
+        await server.serve_forever()
+
+
+def run():
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("coordinator stopped")
+    except Exception:
+        logger.exception("coordinator crashed")
+        raise
